@@ -17,6 +17,7 @@
 #define MAX_NAME 72
 #define BUF_SIZE 256
 #define MSG_BODY_SIZE 100   // message body length is at most 99
+#define MAX_GAMES 64        // max number of concurrent games
 
 // global piles for the Nim game
 int piles[5] = {1, 3, 5, 7, 9};
@@ -26,7 +27,17 @@ typedef struct {
     char name[MAX_NAME + 1];
 } Player;
 
-// function headers
+// track active games and which names are in them
+typedef struct {
+    pid_t pid;                    // child process id for this game
+    char p1[MAX_NAME + 1];        // name of player 1
+    char p2[MAX_NAME + 1];        // name of player 2
+    int active;                   // 1 if this game is running
+} Game;
+
+// global array of games
+Game games[MAX_GAMES];
+
 void play_game(Player p1, Player p2);
 int handle_message(Player *me, Player *opp, int *turn, int my_id);
 void send_fail(int fd, char *code, char *msg, int close_conn);
@@ -60,7 +71,17 @@ int main(int argc, char *argv[]) {
 
     const char wait_msg[] = "0|05|WAIT|";
 
+    int i;
+
     setvbuf(stdout, NULL, _IONBF, 0);
+
+    // initialize games array
+    for (i = 0; i < MAX_GAMES; i++) {
+        games[i].active = 0;
+        games[i].pid = 0;
+        games[i].p1[0] = '\0';
+        games[i].p2[0] = '\0';
+    }
 
     signal(SIGCHLD, sigchld_handler);
     signal(SIGPIPE, SIG_IGN);
@@ -143,7 +164,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // first byte must be 0 and message must contain OPEN
+            // first byte must be '0' and message must contain OPEN
             if (buf[0] != '0') {
                 close(new_socket);
                 continue;
@@ -185,6 +206,30 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
+            // check if this name is already playing somewhere
+            int in_use = 0;
+
+            // check waiting player name
+            if (waiting && strcmp(name_start, waiting_player.name) == 0) {
+                in_use = 1;
+            } else {
+                // check every active game
+                for (i = 0; i < MAX_GAMES; i++) {
+                    if (games[i].active) {
+                        if (strcmp(name_start, games[i].p1) == 0 ||
+                            strcmp(name_start, games[i].p2) == 0) {
+                            in_use = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (in_use) {
+                send_fail(new_socket, (char *)"22", (char *)"Already Playing", 1);
+                continue;
+            }
+
             Player temp;
             temp.fd = new_socket;
             strcpy(temp.name, name_start);
@@ -202,20 +247,51 @@ int main(int argc, char *argv[]) {
                 printf("Matching %s with %s.\n",
                        waiting_player.name, temp.name);
 
-                pid = fork();
-                if (pid == 0) {
-                    // child process handles the actual game
-                    close(server_fd);
-                    play_game(waiting_player, temp);
-                    exit(0);
-                } else if (pid > 0) {
-                    // parent closes player sockets and goes back to waiting
+                // find a free game slot
+                int game_index = -1;
+                for (i = 0; i < MAX_GAMES; i++) {
+                    if (!games[i].active) {
+                        game_index = i;
+                        break;
+                    }
+                }
+
+                if (game_index == -1) {
+                    // no room for more games
+                    send_fail(waiting_player.fd, (char *)"20", (char *)"Server Busy", 1);
+                    send_fail(temp.fd, (char *)"20", (char *)"Server Busy", 1);
                     close(waiting_player.fd);
                     close(temp.fd);
                     waiting = 0;
                 } else {
-                    perror("fork");
-                    close(new_socket);
+                    // record the game in the games array
+                    games[game_index].active = 1;
+                    games[game_index].pid = 0;
+                    strncpy(games[game_index].p1, waiting_player.name, MAX_NAME);
+                    games[game_index].p1[MAX_NAME] = '\0';
+                    strncpy(games[game_index].p2, temp.name, MAX_NAME);
+                    games[game_index].p2[MAX_NAME] = '\0';
+
+                    pid = fork();
+                    if (pid == 0) {
+                        // child handles the actual game
+                        close(server_fd);
+                        play_game(waiting_player, temp);
+                        exit(0);
+                    } else if (pid > 0) {
+                        // parent stores the child's pid, closes fds, clears waiting
+                        games[game_index].pid = pid;
+                        close(waiting_player.fd);
+                        close(temp.fd);
+                        waiting = 0;
+                    } else {
+                        perror("fork");
+                        // undo game slot
+                        games[game_index].active = 0;
+                        games[game_index].p1[0] = '\0';
+                        games[game_index].p2[0] = '\0';
+                        close(new_socket);
+                    }
                 }
             }
         }
@@ -266,12 +342,27 @@ int main(int argc, char *argv[]) {
     return 0;
 }
 
-// handle SIGCHLD to clean up child processes
+// handle SIGCHLD to clean up child processes and clear finished games
 void sigchld_handler(int s) {
     (void)s;
-    while (waitpid(-1, NULL, WNOHANG) > 0);
+    pid_t dead;
+
+    // collect all finished children
+    while ((dead = waitpid(-1, NULL, WNOHANG)) > 0) {
+        int i;
+        for (i = 0; i < MAX_GAMES; i++) {
+            if (games[i].active && games[i].pid == dead) {
+                games[i].active = 0;
+                games[i].pid = 0;
+                games[i].p1[0] = '\0';
+                games[i].p2[0] = '\0';
+                break;
+            }
+        }
+    }
 }
 
+// disable Nagle's algorithm on a socket
 void disable_nagle(int fd) {
     int flag = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag));
