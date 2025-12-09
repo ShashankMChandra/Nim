@@ -225,13 +225,14 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // first byte must be '0' and message must contain OPEN
-            if(buf[0] != '0') {
-                close(new_socket);
+            // first byte must be '0', otherwise FAIL 10.
+            if (buf[0] != '0') {
+                send_fail(new_socket, (char *)"10", (char *)"Invalid", 1);
                 continue;
             }
 
-            if(strstr(buf, "OPEN") == NULL) {
+            // message must contain OPEN as the first command on a new connection
+            if (strstr(buf, "OPEN") == NULL) {
                 send_fail(new_socket, (char *)"10", (char *)"Invalid", 1);
                 continue;
             }

@@ -1,8 +1,7 @@
 Shreyas Bhatkande, srb320
+Shashank Chandra, smc579
 
-
-We attempted the extra credit.
-
+Our server handles concurrent games and the extra credit.
 
 To test, we ran multiple games to make sure that everything was accounted for. This included a normal match between
 two players, having multiple games simultaneously, and disconnecting and reconnecting to games. We made sure that
