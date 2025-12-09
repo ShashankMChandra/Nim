@@ -1,0 +1,15 @@
+Shreyas Bhatkande, srb320
+
+
+We attempted the extra credit.
+
+
+To test, we ran multiple games to make sure that everything was accounted for. This included a normal match between
+two players, having multiple games simultaneously, and disconnecting and reconnecting to games. We made sure that
+more than one game could be played at once and it could handle people disconnecting and reconnecting. We also
+tested the common error codes, such as trying to play while not in a game, having too long of a name
+trying to play out of turn, taking too much from a pile, and taking from a pile that doesn't exist.
+
+tests.c also tests these errors and makes sure the socket is actually working, and can be ran with:
+./tests <host> <port>
+after the main server is started

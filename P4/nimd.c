@@ -7,17 +7,18 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
-#include <sys/select.h>
+#include <poll.h>         
 #include <sys/time.h>
 #include <ctype.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <errno.h>
+#include <netdb.h>
 
 #define MAX_NAME 72
 #define BUF_SIZE 256
-#define MSG_BODY_SIZE 100   // message body length is at most 99
-#define MAX_GAMES 64        // max number of concurrent games
+#define MSG_BODY_SIZE 100 // message body length is at most 99
+#define MAX_GAMES 64 // max number of concurrent games
 
 // global piles for the Nim game
 int piles[5] = {1, 3, 5, 7, 9};
@@ -29,10 +30,10 @@ typedef struct {
 
 // track active games and which names are in them
 typedef struct {
-    pid_t pid;                    // child process id for this game
-    char p1[MAX_NAME + 1];        // name of player 1
-    char p2[MAX_NAME + 1];        // name of player 2
-    int active;                   // 1 if this game is running
+    pid_t pid;                  
+    char p1[MAX_NAME + 1];      
+    char p2[MAX_NAME + 1];      
+    int active;                 
 } Game;
 
 // global array of games
@@ -44,14 +45,10 @@ void send_fail(int fd, char *code, char *msg, int close_conn);
 void send_over(int fd1, int fd2, int winner, char *reason);
 void broadcast_play(int fd1, int fd2, int next_player);
 void sigchld_handler(int s);
-void disable_nagle(int fd);
 
 // main server program
 int main(int argc, char *argv[]) {
-    int server_fd, new_socket;
-    struct sockaddr_in address;
-    int opt = 1;
-    socklen_t addrlen = sizeof(address);
+    int new_socket;
     int port;
 
     char buf[BUF_SIZE];
@@ -65,112 +62,176 @@ int main(int argc, char *argv[]) {
     int waiting = 0;     // 0 means nobody waiting, 1 means one player waiting
     int pid;
 
-    fd_set readfds;
-    int max_sd;
+    struct pollfd pollfds[2]; // poll array for server and waiting player
+    int nfds;                 // number of fds to poll
     int activity;
 
     const char wait_msg[] = "0|05|WAIT|";
 
     int i;
 
-    setvbuf(stdout, NULL, _IONBF, 0);
-
     // initialize games array
-    for (i = 0; i < MAX_GAMES; i++) {
+    for(i = 0; i < MAX_GAMES; i++) {
         games[i].active = 0;
         games[i].pid = 0;
         games[i].p1[0] = '\0';
         games[i].p2[0] = '\0';
     }
 
-    signal(SIGCHLD, sigchld_handler);
-    signal(SIGPIPE, SIG_IGN);
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
 
-    if (argc != 2) {
+    if(sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("sigaction SIGCHLD failed");
+        exit(1);
+    }
+
+    struct sigaction sa_pipe;
+    memset(&sa_pipe, 0, sizeof(sa_pipe));
+    sa_pipe.sa_handler = SIG_IGN;
+    if(sigaction(SIGPIPE, &sa_pipe, NULL) == -1) {
+        perror("sigaction SIGPIPE failed");
+        exit(1);
+    }
+
+    if(argc != 2) {
         fprintf(stderr, "Usage: %s <port>\n", argv[0]);
         exit(1);
     }
 
     port = atoi(argv[1]);
 
-    // create listening socket
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
-        perror("socket failed");
-        exit(1);
+    struct addrinfo hints, *servinfo, *info;
+    int rv;
+    int server_fd;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC;     
+    hints.ai_socktype = SOCK_STREAM; 
+    hints.ai_flags = AI_PASSIVE;     
+
+    if((rv = getaddrinfo(NULL, argv[1], &hints, &servinfo)) != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        return 1;
     }
 
-    // allow reuse of address
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
-        perror("setsockopt");
-        exit(1);
-    }
-
-    // set up server address
-    memset(&address, 0, sizeof(address));
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-
-    // bind socket to port
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("bind failed");
-        exit(1);
-    }
-
-    // start listening
-    if (listen(server_fd, 3) < 0) {
-        perror("listen");
-        exit(1);
-    }
-
-    printf("Server listening on port %d...\n", port);
-
-    // main loop: accept new players and handle waiting player state
-    while (1) {
-        FD_ZERO(&readfds);
-        FD_SET(server_fd, &readfds);
-        max_sd = server_fd;
-
-        // if someone is waiting, watch their socket too
-        if (waiting) {
-            FD_SET(waiting_player.fd, &readfds);
-            if (waiting_player.fd > max_sd) {
-                max_sd = waiting_player.fd;
-            }
-        }
-
-        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
-        if (activity < 0) {
-            if (errno == EINTR) continue;
-            perror("select");
+    for(info = servinfo; info != NULL; info = info->ai_next) {
+        if((server_fd = socket(info->ai_family, info->ai_socktype, info->ai_protocol)) == -1) {
+            perror("server: socket");
             continue;
         }
 
-        // new incoming connection on listening socket
-        if (FD_ISSET(server_fd, &readfds)) {
-            new_socket = accept(server_fd, (struct sockaddr *)&address, &addrlen);
-            if (new_socket < 0) {
-                if (errno == EINTR) continue;
-                perror("accept");
+        if(bind(server_fd, info->ai_addr, info->ai_addrlen) == -1) {
+            close(server_fd);
+            perror("server: bind");
+            continue;
+        }
+
+        break;     
+    }
+
+    if(info == NULL) {
+        freeaddrinfo(servinfo);
+        fprintf(stderr, "server: failed to bind\n");
+        return 2;
+    }
+
+    freeaddrinfo(servinfo); 
+
+    if(listen(server_fd, 3) == -1) {
+        perror("listen");
+        return 1;
+    }
+    struct sockaddr_storage remote_addr;
+    socklen_t remote_addrlen = sizeof(remote_addr);   
+    printf("Server listening on port %d...\n", port);
+
+    // main loop: accept new players and handle waiting player state
+    while(1) {
+        // Setup poll structure
+        pollfds[0].fd = server_fd;
+        pollfds[0].events = POLLIN;
+        nfds = 1;
+
+        // if someone is waiting, watch their socket too
+        if(waiting) {
+            pollfds[1].fd = waiting_player.fd;
+            pollfds[1].events = POLLIN;
+            nfds = 2;
+        }
+
+        activity = poll(pollfds, nfds, -1); 
+        if(activity < 0) {
+            if(errno == EINTR) continue;
+            perror("poll");
+            continue;
+        }
+
+        // handle extra messages from the waiting player
+        if(waiting && (pollfds[1].revents & POLLIN)) {
+            memset(buf, 0, BUF_SIZE);
+            valread = read(waiting_player.fd, buf, BUF_SIZE);
+
+            // if waiting player disconnects
+            if(valread <= 0) {
+                printf("Waiting player %s disconnected before match.\n", waiting_player.name);
+                close(waiting_player.fd);
+                waiting = 0;
                 continue;
             }
 
-            disable_nagle(new_socket);
+            // waiting player sent some message, check it
+            if(buf[0] != '0') {
+                send_fail(waiting_player.fd, (char *)"10", (char *)"Invalid", 1);
+                waiting = 0;
+                continue;
+            }
+
+            char type[5];
+            memset(type, 0, sizeof(type));
+            strncpy(type, buf + 5, 4);
+            type[4] = '\0';
+
+            // second OPEN on same connection
+            if(strcmp(type, "OPEN") == 0) {
+                send_fail(waiting_player.fd, (char *)"23", (char *)"Already Open", 1);
+            }
+            // MOVE while not in a game yet
+            else if(strcmp(type, "MOVE") == 0) {
+                send_fail(waiting_player.fd, (char *)"24", (char *)"Not Playing", 1);
+            }
+            // any other bad message
+            else {
+                send_fail(waiting_player.fd, (char *)"10", (char *)"Invalid", 1);
+            }
+
+            waiting = 0;
+        }
+
+        // new incoming connection on listening socket
+        if(pollfds[0].revents & POLLIN) {
+            new_socket = accept(server_fd, (struct sockaddr *)&remote_addr, &remote_addrlen);
+
+            if(new_socket < 0) {
+                perror("accept failed");
+                continue;
+            }
 
             memset(buf, 0, BUF_SIZE);
             valread = read(new_socket, buf, BUF_SIZE);
-            if (valread <= 0) {
+            if(valread <= 0) {
                 close(new_socket);
                 continue;
             }
 
             // first byte must be '0' and message must contain OPEN
-            if (buf[0] != '0') {
+            if(buf[0] != '0') {
                 close(new_socket);
                 continue;
             }
 
-            if (strstr(buf, "OPEN") == NULL) {
+            if(strstr(buf, "OPEN") == NULL) {
                 send_fail(new_socket, (char *)"10", (char *)"Invalid", 1);
                 continue;
             }
@@ -180,10 +241,10 @@ int main(int argc, char *argv[]) {
             pipes_count = 0;
             name_start = NULL;
 
-            while (*ptr) {
-                if (*ptr == '|') {
+            while(*ptr) {
+                if(*ptr == '|') {
                     pipes_count++;
-                    if (pipes_count == 3) {
+                    if(pipes_count == 3) {
                         name_start = ptr + 1;
                         break;
                     }
@@ -191,17 +252,17 @@ int main(int argc, char *argv[]) {
                 ptr++;
             }
 
-            if (name_start == NULL) {
+            if(name_start == NULL) {
                 send_fail(new_socket, (char *)"10", (char *)"Invalid", 1);
                 continue;
             }
 
             name_end = strchr(name_start, '|');
-            if (name_end != NULL) {
+            if(name_end != NULL) {
                 *name_end = '\0';
             }
 
-            if (strlen(name_start) > MAX_NAME) {
+            if(strlen(name_start) > MAX_NAME) {
                 send_fail(new_socket, (char *)"21", (char *)"Long Name", 1);
                 continue;
             }
@@ -210,13 +271,13 @@ int main(int argc, char *argv[]) {
             int in_use = 0;
 
             // check waiting player name
-            if (waiting && strcmp(name_start, waiting_player.name) == 0) {
+            if(waiting && strcmp(name_start, waiting_player.name) == 0) {
                 in_use = 1;
             } else {
                 // check every active game
-                for (i = 0; i < MAX_GAMES; i++) {
-                    if (games[i].active) {
-                        if (strcmp(name_start, games[i].p1) == 0 ||
+                for(i = 0; i < MAX_GAMES; i++) {
+                    if(games[i].active) {
+                        if(strcmp(name_start, games[i].p1) == 0 ||
                             strcmp(name_start, games[i].p2) == 0) {
                             in_use = 1;
                             break;
@@ -225,7 +286,7 @@ int main(int argc, char *argv[]) {
                 }
             }
 
-            if (in_use) {
+            if(in_use) {
                 send_fail(new_socket, (char *)"22", (char *)"Already Playing", 1);
                 continue;
             }
@@ -238,7 +299,7 @@ int main(int argc, char *argv[]) {
             write(new_socket, wait_msg, strlen(wait_msg));
 
             // if no one is waiting, store this player
-            if (!waiting) {
+            if(!waiting) {
                 waiting_player = temp;
                 waiting = 1;
                 printf("Player %s is waiting.\n", waiting_player.name);
@@ -249,14 +310,14 @@ int main(int argc, char *argv[]) {
 
                 // find a free game slot
                 int game_index = -1;
-                for (i = 0; i < MAX_GAMES; i++) {
-                    if (!games[i].active) {
+                for(i = 0; i < MAX_GAMES; i++) {
+                    if(!games[i].active) {
                         game_index = i;
                         break;
                     }
                 }
 
-                if (game_index == -1) {
+                if(game_index == -1) {
                     // no room for more games
                     send_fail(waiting_player.fd, (char *)"20", (char *)"Server Busy", 1);
                     send_fail(temp.fd, (char *)"20", (char *)"Server Busy", 1);
@@ -273,12 +334,12 @@ int main(int argc, char *argv[]) {
                     games[game_index].p2[MAX_NAME] = '\0';
 
                     pid = fork();
-                    if (pid == 0) {
+                    if(pid == 0) {
                         // child handles the actual game
                         close(server_fd);
                         play_game(waiting_player, temp);
                         exit(0);
-                    } else if (pid > 0) {
+                    } else if(pid > 0) {
                         // parent stores the child's pid, closes fds, clears waiting
                         games[game_index].pid = pid;
                         close(waiting_player.fd);
@@ -296,47 +357,6 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        // handle extra messages from the waiting player
-        if (waiting && FD_ISSET(waiting_player.fd, &readfds)) {
-            memset(buf, 0, BUF_SIZE);
-            valread = read(waiting_player.fd, buf, BUF_SIZE);
-
-            // if waiting player disconnects
-            if (valread <= 0) {
-                printf("Waiting player %s disconnected before match.\n",
-                       waiting_player.name);
-                close(waiting_player.fd);
-                waiting = 0;
-                continue;
-            }
-
-            // waiting player sent some message, check it
-            if (buf[0] != '0') {
-                send_fail(waiting_player.fd, (char *)"10", (char *)"Invalid", 1);
-                waiting = 0;
-                continue;
-            }
-
-            char type[5];
-            memset(type, 0, sizeof(type));
-            strncpy(type, buf + 5, 4);
-            type[4] = '\0';
-
-            // second OPEN on same connection
-            if (strcmp(type, "OPEN") == 0) {
-                send_fail(waiting_player.fd, (char *)"23", (char *)"Already Open", 1);
-            }
-            // MOVE while not in a game yet
-            else if (strcmp(type, "MOVE") == 0) {
-                send_fail(waiting_player.fd, (char *)"24", (char *)"Not Playing", 1);
-            }
-            // any other bad message
-            else {
-                send_fail(waiting_player.fd, (char *)"10", (char *)"Invalid", 1);
-            }
-
-            waiting = 0;
-        }
     }
 
     return 0;
@@ -344,14 +364,13 @@ int main(int argc, char *argv[]) {
 
 // handle SIGCHLD to clean up child processes and clear finished games
 void sigchld_handler(int s) {
-    (void)s;
     pid_t dead;
 
     // collect all finished children
-    while ((dead = waitpid(-1, NULL, WNOHANG)) > 0) {
+    while((dead = waitpid(-1, NULL, WNOHANG)) > 0) {
         int i;
-        for (i = 0; i < MAX_GAMES; i++) {
-            if (games[i].active && games[i].pid == dead) {
+        for(i = 0; i < MAX_GAMES; i++) {
+            if(games[i].active && games[i].pid == dead) {
                 games[i].active = 0;
                 games[i].pid = 0;
                 games[i].p1[0] = '\0';
@@ -360,12 +379,6 @@ void sigchld_handler(int s) {
             }
         }
     }
-}
-
-// disable Nagle's algorithm on a socket
-void disable_nagle(int fd) {
-    int flag = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag));
 }
 
 // handle a single message from one player during a game
@@ -381,16 +394,16 @@ int handle_message(Player *me, Player *opp, int *turn, int my_id) {
     // read one message, retry if interrupted
     do {
         n = read(me->fd, buf, BUF_SIZE);
-    } while (n < 0 && errno == EINTR);
+    } while(n < 0 && errno == EINTR);
 
     // if read <= 0, player disconnected (forfeit)
-    if (n <= 0) {
+    if(n <= 0) {
         printf("Player %s disconnected (forfeit).\n", me->name);
         return -1;
     }
 
     // check NGP version
-    if (buf[0] != '0') {
+    if(buf[0] != '0') {
         send_fail(me->fd, (char *)"10", (char *)"Invalid", 1);
         return -1;
     }
@@ -400,19 +413,19 @@ int handle_message(Player *me, Player *opp, int *turn, int my_id) {
     type[4] = '\0';
 
     // second OPEN during game is not allowed
-    if (strcmp(type, "OPEN") == 0) {
+    if(strcmp(type, "OPEN") == 0) {
         send_fail(me->fd, (char *)"23", (char *)"Already Open", 1);
         return -1;
     }
 
     // only MOVE messages are valid here
-    if (strcmp(type, "MOVE") != 0) {
+    if(strcmp(type, "MOVE") != 0) {
         send_fail(me->fd, (char *)"10", (char *)"Invalid", 1);
         return -1;
     }
 
     // check if it is this player's turn
-    if (*turn != my_id) {
+    if(*turn != my_id) {
         send_fail(me->fd, (char *)"31", (char *)"Impatient", 0);
         return 2;
     }
@@ -421,7 +434,7 @@ int handle_message(Player *me, Player *opp, int *turn, int my_id) {
     pile_str = buf + 10;
 
     split = strchr(pile_str, '|');
-    if (!split) {
+    if(!split) {
         send_fail(me->fd, (char *)"10", (char *)"Invalid", 1);
         return -1;
     }
@@ -430,19 +443,19 @@ int handle_message(Player *me, Player *opp, int *turn, int my_id) {
     count_str = split + 1;
 
     end = strchr(count_str, '|');
-    if (end) *end = '\0';
+    if(end) *end = '\0';
 
     pile_idx = atoi(pile_str);
-    count    = atoi(count_str);
+    count = atoi(count_str);
 
     // check pile index range
-    if (pile_idx < 0 || pile_idx > 4) {
+    if(pile_idx < 0 || pile_idx > 4) {
         send_fail(me->fd, (char *)"32", (char *)"Pile Index", 0);
         return 2;
     }
 
     // check count range
-    if (count < 1 || count > piles[pile_idx]) {
+    if(count < 1 || count > piles[pile_idx]) {
         send_fail(me->fd, (char *)"33", (char *)"Quantity", 0);
         return 2;
     }
@@ -461,25 +474,25 @@ void play_game(Player p1, Player p2) {
     char body[MSG_BODY_SIZE];
     int current_turn = 1;
     int game_running = 1;
-    int max_sd, activity, result, i, stones_left;
-    fd_set readfds;
+    int activity, result, i, stones_left;
+    struct pollfd game_fds[2];
 
     // set initial piles to 1, 3, 5, 7, 9
-    for (i = 0; i < 5; i++) {
+    for(i = 0; i < 5; i++) {
         piles[i] = 2 * i + 1;
     }
 
     // tell player 1 about player 2
     snprintf(body, sizeof(body), "NAME|1|%s|", p2.name);
     int len = (int)strlen(body);
-    if (len > 99) len = 99;
+    if(len > 99) len = 99;
     snprintf(buf, sizeof(buf), "0|%02d|%s", len, body);
     write(p1.fd, buf, strlen(buf));
 
     // tell player 2 about player 1
     snprintf(body, sizeof(body), "NAME|2|%s|", p1.name);
     len = (int)strlen(body);
-    if (len > 99) len = 99;
+    if(len > 99) len = 99;
     snprintf(buf, sizeof(buf), "0|%02d|%s", len, body);
     write(p2.fd, buf, strlen(buf));
 
@@ -487,38 +500,37 @@ void play_game(Player p1, Player p2) {
     broadcast_play(p1.fd, p2.fd, current_turn);
 
     // main game loop
-    while (game_running) {
-        FD_ZERO(&readfds);
-        FD_SET(p1.fd, &readfds);
-        FD_SET(p2.fd, &readfds);
+    while(game_running) {
+        game_fds[0].fd = p1.fd;
+        game_fds[0].events = POLLIN;
+        game_fds[1].fd = p2.fd;
+        game_fds[1].events = POLLIN;
 
-        max_sd = (p1.fd > p2.fd ? p1.fd : p2.fd);
-
-        activity = select(max_sd + 1, &readfds, NULL, NULL, NULL);
-        if (activity < 0) {
-            if (errno == EINTR) continue;
-            perror("select error");
+        activity = poll(game_fds, 2, -1);
+        if(activity < 0) {
+            if(errno == EINTR) continue;
+            perror("poll error");
             break;
         }
 
         // handle input from player 1
-        if (FD_ISSET(p1.fd, &readfds)) {
+        if(game_fds[0].revents & POLLIN) {
             result = handle_message(&p1, &p2, &current_turn, 1);
 
             // result < 0 means p1 forfeited or bad error
-            if (result < 0) {
+            if(result < 0) {
                 send_over(p2.fd, -1, 2, (char *)"Forfeit");
                 game_running = 0;
                 break;
             }
 
             // result == 1 means valid move
-            if (result == 1) {
+            if(result == 1) {
                 stones_left = 0;
-                for (i = 0; i < 5; i++) stones_left += piles[i];
+                for(i = 0; i < 5; i++) stones_left += piles[i];
 
                 // if no stones left, player 1 wins normally
-                if (stones_left == 0) {
+                if(stones_left == 0) {
                     send_over(p1.fd, p2.fd, 1, (char *)"");
                     game_running = 0;
                     break;
@@ -531,23 +543,23 @@ void play_game(Player p1, Player p2) {
         }
 
         // handle input from player 2
-        if (game_running && FD_ISSET(p2.fd, &readfds)) {
+        if(game_running && (game_fds[1].revents & POLLIN)) {
             result = handle_message(&p2, &p1, &current_turn, 2);
 
             // result < 0 means p2 forfeited or bad error
-            if (result < 0) {
+            if(result < 0) {
                 send_over(p1.fd, -1, 1, (char *)"Forfeit");
                 game_running = 0;
                 break;
             }
 
             // result == 1 means valid move
-            if (result == 1) {
+            if(result == 1) {
                 stones_left = 0;
-                for (i = 0; i < 5; i++) stones_left += piles[i];
+                for(i = 0; i < 5; i++) stones_left += piles[i];
 
                 // if no stones left, player 2 wins normally
-                if (stones_left == 0) {
+                if(stones_left == 0) {
                     send_over(p1.fd, p2.fd, 2, (char *)"");
                     game_running = 0;
                     break;
@@ -580,7 +592,7 @@ void broadcast_play(int fd1, int fd2, int next_player) {
 
     snprintf(body, sizeof(body), "PLAY|%d|%s|", next_player, piles_str);
     int len = (int)strlen(body);
-    if (len > 99) len = 99;
+    if(len > 99) len = 99;
     snprintf(buf, sizeof(buf), "0|%02d|%s", len, body);
 
     write(fd1, buf, strlen(buf));
@@ -602,11 +614,11 @@ void send_over(int fd1, int fd2, int winner, char *reason) {
     snprintf(body, sizeof(body), "OVER|%d|%s|%s|",
              winner, piles_str, reason);
     int len = (int)strlen(body);
-    if (len > 99) len = 99;
+    if(len > 99) len = 99;
     snprintf(buf, sizeof(buf), "0|%02d|%s", len, body);
 
-    if (fd1 != -1) write(fd1, buf, strlen(buf));
-    if (fd2 != -1) write(fd2, buf, strlen(buf));
+    if(fd1 != -1) write(fd1, buf, strlen(buf));
+    if(fd2 != -1) write(fd2, buf, strlen(buf));
 
     printf("Game Over. Winner: %d. Reason: %s\n", winner, reason);
 }
@@ -618,12 +630,12 @@ void send_fail(int fd, char *code, char *msg, int close_conn) {
 
     snprintf(body, sizeof(body), "FAIL|%s|%s|", code, msg);
     int len = (int)strlen(body);
-    if (len > 99) len = 99;
+    if(len > 99) len = 99;
     snprintf(buf, sizeof(buf), "0|%02d|%s", len, body);
 
     write(fd, buf, strlen(buf));
 
-    if (close_conn) {
+    if(close_conn) {
         shutdown(fd, SHUT_WR);
         close(fd);
     }
